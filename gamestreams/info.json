@@ -1,0 +1,23 @@
+{
+  "author": [
+    "Akai"
+  ],
+  "name": "GameStreams",
+  "install_msg": "Thank you for installing the GameStreams cog. This cog requires `Streams` cog. To receive live updates about new game streams, provide a Client ID and Client Secret from [Twitch](https://dev.twitch.tv/dashboard/apps). Read `[p]streamset twitchtoken` for more info.",
+  "description": "Get real-time announcements whenever a new stream starts for a specific game.",
+  "short": "Receive live announcements for new game streams.",
+  "hidden": false,
+  "tags": [
+    "game",
+    "stream",
+    "twitch"
+  ],
+  "permissions": [
+    "send_messages",
+    "embed_link"
+  ],
+  "requirements": ["iso639"],
+  "required_cogs": {"streams": "https://github.com/Cog-Creators/Red-DiscordBot"},
+  "end_user_data_statement": "This cog only processes data related to game stream announcements and does not store any personal user information.",
+  "type": "COG"
+}
