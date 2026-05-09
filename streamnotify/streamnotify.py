@@ -164,6 +164,7 @@ async def check_tiktok_live(session: aiohttp.ClientSession, username: str):
     profile_url = f"https://www.tiktok.com/@{handle}"
     live_url = f"https://www.tiktok.com/@{handle}/live"
 
+    # ENHANCED HEADERS FOR TIKTOK DETECTION
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -171,7 +172,7 @@ async def check_tiktok_live(session: aiohttp.ClientSession, username: str):
             "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Referer": "https://www.tiktok.com/",
     }
 
@@ -223,8 +224,6 @@ async def check_tiktok_live(session: aiohttp.ClientSession, username: str):
         log.error(f"[TikTok] Profile scrape error for '{handle}': {e}")
 
     # ── Method 2: check /live page — TikTok redirects to profile if not live ──
-    # If the /live page returns 200 and contains live-stream specific content,
-    # the user is live. If they're NOT live it redirects or shows a 4xx.
     try:
         async with session.get(live_url, headers=headers, allow_redirects=False) as resp:
             # A 200 on the /live page is a strong signal they're live
@@ -407,6 +406,7 @@ class StreamNotify(commands.Cog):
     default_guild = {
         "notify_channel": None,       # channel id to post notifications in
         "streamer_role": None,         # role id required to register channels
+        "ping_role_id": None,          # NEW: Custom role to ping instead of @everyone
         "blocklist": [],               # list of discord user ids blocked from registering
         "poll_interval": DEFAULT_POLL_INTERVAL,  # seconds between each poll cycle
         # API keys
@@ -498,6 +498,10 @@ class StreamNotify(commands.Cog):
             log.warning(f"[StreamNotify] Guild '{guild.name}': notify channel {notify_channel_id} not found.")
             return
 
+        # PING ROLE LOGIC
+        ping_role_id = await cfg.ping_role_id()
+        ping_content = f"<@&{ping_role_id}>" if ping_role_id else "@everyone"
+
         streamers = await cfg.streamers()
         if not streamers:
             log.debug(f"[StreamNotify] Guild '{guild.name}': no registered streamers.")
@@ -562,8 +566,9 @@ class StreamNotify(commands.Cog):
                     )
                     embed = build_live_embed(platform, stream_data, member)
                     try:
+                        # USE DYNAMIC PING CONTENT
                         await notify_channel.send(
-                            content=f"@everyone {member.mention} just went live!", embed=embed
+                            content=f"{ping_content} {member.mention} just went live!", embed=embed
                         )
                     except discord.Forbidden:
                         log.warning(
@@ -625,6 +630,16 @@ class StreamNotify(commands.Cog):
     @checks.admin_or_permissions(administrator=True)
     async def streamnotify(self, ctx: commands.Context):
         """Admin configuration for StreamNotify."""
+
+    @streamnotify.command(name="setpingrole")
+    async def sn_setpingrole(self, ctx: commands.Context, role: discord.Role = None):
+        """Set a specific role to ping in notifications. Mention no role to revert to @everyone."""
+        if role:
+            await self.config.guild(ctx.guild).ping_role_id.set(role.id)
+            await ctx.send(f"✅ Notifications will now ping **{role.name}**.")
+        else:
+            await self.config.guild(ctx.guild).ping_role_id.set(None)
+            await ctx.send("✅ Notifications will now ping **@everyone**.")
 
     @streamnotify.command(name="setchannel")
     async def sn_setchannel(self, ctx: commands.Context, channel: discord.TextChannel):
@@ -761,6 +776,7 @@ class StreamNotify(commands.Cog):
         cfg = self.config.guild(ctx.guild)
         channel_id = await cfg.notify_channel()
         role_id = await cfg.streamer_role()
+        ping_id = await cfg.ping_role_id()
         tw = await cfg.twitch_client_id()
         yt = await cfg.youtube_api_key()
         bl = await cfg.blocklist()
@@ -770,10 +786,12 @@ class StreamNotify(commands.Cog):
 
         channel = ctx.guild.get_channel(channel_id) if channel_id else None
         role = ctx.guild.get_role(role_id) if role_id else None
+        prole = ctx.guild.get_role(ping_id) if ping_id else None
 
         embed = discord.Embed(title="⚙️ StreamNotify Status", colour=discord.Colour.blurple())
         embed.add_field(name="Notify Channel", value=channel.mention if channel else "❌ Not set", inline=True)
         embed.add_field(name="Required Role", value=role.name if role else "❌ Not set", inline=True)
+        embed.add_field(name="Ping Role", value=prole.name if prole else "@everyone", inline=True)
         embed.add_field(
             name="Poll Interval",
             value=f"⏱️ Every **{interval_mins}** minute{'s' if interval_mins != 1 else ''}",
@@ -949,6 +967,13 @@ class StreamNotify(commands.Cog):
             if uid not in streamers:
                 streamers[uid] = {}
             streamers[uid][platform] = handle
+
+        # FIX FOR "INSTANT NOTIFICATION" BUG
+        # Initialize the cache as 'True' so it doesn't trigger a "went live" state change immediately
+        async with cfg.live_cache() as cache:
+            if str(user.id) not in cache:
+                cache[str(user.id)] = {}
+            cache[str(user.id)][platform] = True
 
         await user.send(
             f"✅ Your **{platform.capitalize()}** channel has been registered as `{handle}` in **{guild.name}**!\n"
