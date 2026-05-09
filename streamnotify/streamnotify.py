@@ -6,6 +6,8 @@ Users can self-register their YouTube/Twitch/Kick/TikTok channels via DM.
 
 import asyncio
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
@@ -14,6 +16,11 @@ from redbot.core import commands, Config, checks
 from redbot.core.bot import Red
 
 log = logging.getLogger("red.streamnotify")
+
+# Minimum and maximum allowed poll intervals (seconds)
+MIN_POLL_INTERVAL = 60       # 1 minute
+MAX_POLL_INTERVAL = 3600     # 60 minutes
+DEFAULT_POLL_INTERVAL = 120  # 2 minutes
 
 # ---------------------------------------------------------------------------
 # Platform checker helpers
@@ -29,11 +36,13 @@ async def check_twitch_live(session: aiohttp.ClientSession, username: str, clien
     try:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
+                log.debug(f"[Twitch] HTTP {resp.status} for channel '{username}'")
                 return None
             data = await resp.json()
             streams = data.get("data", [])
             if streams:
                 stream = streams[0]
+                log.debug(f"[Twitch] '{username}' is LIVE — title: {stream.get('title')}")
                 # Fetch user info for avatar/display name
                 user_url = f"https://api.twitch.tv/helix/users?login={username}"
                 async with session.get(user_url, headers=headers) as uresp:
@@ -42,8 +51,9 @@ async def check_twitch_live(session: aiohttp.ClientSession, username: str, clien
                 stream["profile_image_url"] = user_info.get("profile_image_url", "")
                 stream["display_name"] = user_info.get("display_name", username)
                 return stream
+            log.debug(f"[Twitch] '{username}' is not live")
     except Exception as e:
-        log.error(f"Twitch check error for {username}: {e}")
+        log.error(f"[Twitch] Check error for '{username}': {e}")
     return None
 
 
@@ -56,6 +66,7 @@ async def check_youtube_live(session: aiohttp.ClientSession, channel_id: str, ap
     try:
         async with session.get(search_url) as resp:
             if resp.status != 200:
+                log.debug(f"[YouTube] HTTP {resp.status} for channel '{channel_id}'")
                 return None
             data = await resp.json()
             items = data.get("items", [])
@@ -63,6 +74,7 @@ async def check_youtube_live(session: aiohttp.ClientSession, channel_id: str, ap
                 item = items[0]
                 video_id = item["id"]["videoId"]
                 snippet = item["snippet"]
+                log.debug(f"[YouTube] Channel '{channel_id}' is LIVE — video: {video_id}")
                 return {
                     "video_id": video_id,
                     "title": snippet.get("title", "Live Stream"),
@@ -70,8 +82,9 @@ async def check_youtube_live(session: aiohttp.ClientSession, channel_id: str, ap
                     "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", ""),
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                 }
+            log.debug(f"[YouTube] Channel '{channel_id}' is not live")
     except Exception as e:
-        log.error(f"YouTube check error for {channel_id}: {e}")
+        log.error(f"[YouTube] Live check error for '{channel_id}': {e}")
     return None
 
 
@@ -86,6 +99,7 @@ async def check_youtube_clips(session: aiohttp.ClientSession, channel_id: str, a
     try:
         async with session.get(search_url) as resp:
             if resp.status != 200:
+                log.debug(f"[YouTube] Clips check HTTP {resp.status} for '{channel_id}'")
                 return clips
             data = await resp.json()
             for item in data.get("items", []):
@@ -99,8 +113,10 @@ async def check_youtube_clips(session: aiohttp.ClientSession, channel_id: str, a
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                     "published_at": snippet.get("publishedAt", ""),
                 })
+            if clips:
+                log.debug(f"[YouTube] Found {len(clips)} new clip(s) for channel '{channel_id}'")
     except Exception as e:
-        log.error(f"YouTube clips check error for {channel_id}: {e}")
+        log.error(f"[YouTube] Clips check error for '{channel_id}': {e}")
     return clips
 
 
@@ -111,10 +127,12 @@ async def check_kick_live(session: aiohttp.ClientSession, username: str):
     try:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
+                log.debug(f"[Kick] HTTP {resp.status} for channel '{username}'")
                 return None
             data = await resp.json()
             livestream = data.get("livestream")
             if livestream:
+                log.debug(f"[Kick] '{username}' is LIVE — title: {livestream.get('session_title')}")
                 return {
                     "title": livestream.get("session_title", "Live Stream"),
                     "display_name": data.get("user", {}).get("username", username),
@@ -123,8 +141,119 @@ async def check_kick_live(session: aiohttp.ClientSession, username: str):
                     "viewer_count": livestream.get("viewer_count", 0),
                     "avatar": data.get("user", {}).get("profile_pic", ""),
                 }
+            log.debug(f"[Kick] '{username}' is not live")
     except Exception as e:
-        log.error(f"Kick check error for {username}: {e}")
+        log.error(f"[Kick] Check error for '{username}': {e}")
+    return None
+
+
+async def check_tiktok_live(session: aiohttp.ClientSession, username: str):
+    """
+    Scrape the TikTok profile page to detect if a user is currently live.
+
+    TikTok does not have a public live-stream API so we scrape the profile
+    page HTML.  We look for two signals:
+      1. The JSON-LD or embedded __NEXT_DATA__ that contains a liveRoomInfo
+         or "isLiving" flag.
+      2. A fallback: check the /live sub-page for a redirect/title that
+         indicates an active broadcast.
+
+    Returns a dict with stream metadata if live, else None.
+    """
+    handle = username.lstrip("@")
+    profile_url = f"https://www.tiktok.com/@{handle}"
+    live_url = f"https://www.tiktok.com/@{handle}/live"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.tiktok.com/",
+    }
+
+    # ── Method 1: scrape profile page for NEXT_DATA live signals ─────────────
+    try:
+        async with session.get(profile_url, headers=headers, allow_redirects=True) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+
+                # Signal A: liveRoomInfo present in __NEXT_DATA__
+                if '"liveRoomInfo"' in html or '"isLiving":true' in html or '"isLiving": true' in html:
+                    log.debug(f"[TikTok] '{handle}' LIVE detected via __NEXT_DATA__ liveRoomInfo")
+                    # Try to extract title from the page
+                    title_match = re.search(r'"title"\s*:\s*"([^"]{3,120})"', html)
+                    title = title_match.group(1) if title_match else "TikTok LIVE"
+                    # Try to extract display name
+                    dn_match = re.search(r'"nickname"\s*:\s*"([^"]{1,60})"', html)
+                    display_name = dn_match.group(1) if dn_match else handle
+                    # Try to extract avatar
+                    av_match = re.search(r'"avatarLarger"\s*:\s*"(https?://[^"]+)"', html)
+                    avatar = av_match.group(1).replace("\\u002F", "/") if av_match else ""
+                    return {
+                        "title": title,
+                        "display_name": display_name,
+                        "url": live_url,
+                        "avatar": avatar,
+                        "thumbnail": "",  # TikTok doesn't expose live thumbnails publicly
+                    }
+
+                # Signal B: page contains a LIVE badge indicator in meta/og tags
+                if re.search(r'is\s+LIVE', html, re.IGNORECASE):
+                    log.debug(f"[TikTok] '{handle}' LIVE detected via 'is LIVE' text signal")
+                    dn_match = re.search(r'"nickname"\s*:\s*"([^"]{1,60})"', html)
+                    display_name = dn_match.group(1) if dn_match else handle
+                    av_match = re.search(r'"avatarLarger"\s*:\s*"(https?://[^"]+)"', html)
+                    avatar = av_match.group(1).replace("\\u002F", "/") if av_match else ""
+                    return {
+                        "title": "TikTok LIVE",
+                        "display_name": display_name,
+                        "url": live_url,
+                        "avatar": avatar,
+                        "thumbnail": "",
+                    }
+
+                log.debug(f"[TikTok] '{handle}' profile page loaded, no live signal found")
+            else:
+                log.debug(f"[TikTok] Profile page HTTP {resp.status} for '{handle}'")
+    except Exception as e:
+        log.error(f"[TikTok] Profile scrape error for '{handle}': {e}")
+
+    # ── Method 2: check /live page — TikTok redirects to profile if not live ──
+    # If the /live page returns 200 and contains live-stream specific content,
+    # the user is live. If they're NOT live it redirects or shows a 4xx.
+    try:
+        async with session.get(live_url, headers=headers, allow_redirects=False) as resp:
+            # A 200 on the /live page is a strong signal they're live
+            if resp.status == 200:
+                live_html = await resp.text()
+                # Confirm it's actually a live page, not just a profile fallback
+                if '"liveRoomInfo"' in live_html or '"isLiving":true' in live_html or "LIVE" in live_html[:2000]:
+                    log.debug(f"[TikTok] '{handle}' LIVE confirmed via /live page (200 + content match)")
+                    dn_match = re.search(r'"nickname"\s*:\s*"([^"]{1,60})"', live_html)
+                    display_name = dn_match.group(1) if dn_match else handle
+                    title_match = re.search(r'"title"\s*:\s*"([^"]{3,120})"', live_html)
+                    title = title_match.group(1) if title_match else "TikTok LIVE"
+                    av_match = re.search(r'"avatarLarger"\s*:\s*"(https?://[^"]+)"', live_html)
+                    avatar = av_match.group(1).replace("\\u002F", "/") if av_match else ""
+                    return {
+                        "title": title,
+                        "display_name": display_name,
+                        "url": live_url,
+                        "avatar": avatar,
+                        "thumbnail": "",
+                    }
+            elif resp.status in (301, 302, 307, 308):
+                # Redirect away from /live = almost certainly not live
+                log.debug(f"[TikTok] '{handle}' /live redirected ({resp.status}) → not live")
+            else:
+                log.debug(f"[TikTok] '{handle}' /live returned HTTP {resp.status}")
+    except Exception as e:
+        log.error(f"[TikTok] Live page check error for '{handle}': {e}")
+
     return None
 
 
@@ -137,7 +266,7 @@ def build_live_embed(platform: str, stream_data: dict, discord_user: discord.Mem
         "twitch": 0x9146FF,
         "youtube": 0xFF0000,
         "kick": 0x53FC18,
-        "tiktok": 0x010101,
+        "tiktok": 0xFE2C55,  # TikTok brand pink/red
     }
     colour = colour_map.get(platform.lower(), 0x5865F2)
 
@@ -199,6 +328,24 @@ def build_live_embed(platform: str, stream_data: dict, discord_user: discord.Mem
         if avatar:
             embed.set_thumbnail(url=avatar)
 
+    elif platform.lower() == "tiktok":
+        title = stream_data.get("title", "TikTok LIVE")
+        display_name = stream_data.get("display_name", "Creator")
+        url = stream_data.get("url", "")
+        avatar = stream_data.get("avatar", "")
+        thumbnail = stream_data.get("thumbnail", "")
+
+        embed = discord.Embed(
+            title=f"🎵 {display_name} is LIVE on TikTok!",
+            description=f"**{title}**",
+            url=url,
+            colour=colour,
+        )
+        if thumbnail:
+            embed.set_image(url=thumbnail)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+
     else:
         embed = discord.Embed(
             title=f"🔴 Someone went LIVE on {platform}!",
@@ -217,7 +364,7 @@ def build_clip_embed(platform: str, clip_data: dict, discord_user: discord.Membe
         "twitch": 0x9146FF,
         "youtube": 0xFF0000,
         "kick": 0x53FC18,
-        "tiktok": 0x010101,
+        "tiktok": 0xFE2C55,
     }
     colour = colour_map.get(platform.lower(), 0x5865F2)
     title = clip_data.get("title", "New Clip")
@@ -252,14 +399,16 @@ class StreamNotify(commands.Cog):
 
     Admin sets a notification channel and a required role.
     Users with that role can DM the bot to register their platform channels.
-    The bot polls all registered channels every 2 minutes and posts embed
-    notifications when someone goes live or posts a new clip.
+    The bot polls all registered channels on a configurable interval (default
+    2 minutes, range 1–60 minutes) and posts embed notifications when someone
+    goes live or posts a new clip.
     """
 
     default_guild = {
         "notify_channel": None,       # channel id to post notifications in
         "streamer_role": None,         # role id required to register channels
         "blocklist": [],               # list of discord user ids blocked from registering
+        "poll_interval": DEFAULT_POLL_INTERVAL,  # seconds between each poll cycle
         # API keys
         "twitch_client_id": None,
         "twitch_client_secret": None,
@@ -302,30 +451,58 @@ class StreamNotify(commands.Cog):
 
     async def _poll_loop(self):
         await self.bot.wait_until_ready()
+        log.info("[StreamNotify] Poll loop started.")
         while not self.bot.is_closed():
+            cycle_start = datetime.now(timezone.utc)
             try:
                 await self._check_all_guilds()
             except Exception as e:
-                log.exception(f"Poll loop error: {e}")
-            await asyncio.sleep(120)  # poll every 2 minutes
+                log.exception(f"[StreamNotify] Unhandled error in poll cycle: {e}")
+
+            # Determine the shortest poll interval across all guilds so we
+            # never sleep longer than the admin-configured minimum.
+            min_interval = DEFAULT_POLL_INTERVAL
+            for guild in self.bot.guilds:
+                try:
+                    interval = await self.config.guild(guild).poll_interval()
+                    if interval and interval < min_interval:
+                        min_interval = interval
+                except Exception:
+                    pass
+
+            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+            sleep_for = max(10, min_interval - elapsed)
+            log.debug(
+                f"[StreamNotify] Poll cycle complete in {elapsed:.1f}s. "
+                f"Next check in {sleep_for:.0f}s."
+            )
+            await asyncio.sleep(sleep_for)
 
     async def _check_all_guilds(self):
-        for guild in self.bot.guilds:
+        guilds = self.bot.guilds
+        log.debug(f"[StreamNotify] Checking {len(guilds)} guild(s).")
+        for guild in guilds:
             try:
                 await self._check_guild(guild)
             except Exception as e:
-                log.error(f"Error checking guild {guild.id}: {e}")
+                log.error(f"[StreamNotify] Error checking guild '{guild.name}' ({guild.id}): {e}")
 
     async def _check_guild(self, guild: discord.Guild):
         cfg = self.config.guild(guild)
         notify_channel_id = await cfg.notify_channel()
         if not notify_channel_id:
+            log.debug(f"[StreamNotify] Guild '{guild.name}': no notify channel set, skipping.")
             return
         notify_channel = guild.get_channel(notify_channel_id)
         if not notify_channel:
+            log.warning(f"[StreamNotify] Guild '{guild.name}': notify channel {notify_channel_id} not found.")
             return
 
         streamers = await cfg.streamers()
+        if not streamers:
+            log.debug(f"[StreamNotify] Guild '{guild.name}': no registered streamers.")
+            return
+
         live_cache = await cfg.live_cache()
         last_clip_check = await cfg.last_clip_check()
         posted_clips = await cfg.posted_clips()
@@ -334,11 +511,16 @@ class StreamNotify(commands.Cog):
         twitch_token = await cfg.twitch_access_token()
         yt_key = await cfg.youtube_api_key()
 
-        import datetime
+        log.debug(
+            f"[StreamNotify] Guild '{guild.name}': checking {len(streamers)} streamer(s). "
+            f"Twitch={'✓' if twitch_client_id else '✗'}  "
+            f"YouTube={'✓' if yt_key else '✗'}"
+        )
 
         for user_id_str, platforms in streamers.items():
             member = guild.get_member(int(user_id_str))
             if not member:
+                log.debug(f"[StreamNotify] User {user_id_str} not found in guild '{guild.name}', skipping.")
                 continue
 
             user_live = live_cache.get(user_id_str, {})
@@ -349,48 +531,82 @@ class StreamNotify(commands.Cog):
                 if not handle:
                     continue
 
-                # ---- LIVE CHECK ----
+                log.debug(f"[StreamNotify] Checking {platform} '{handle}' for {member.display_name}...")
+
+                # ── LIVE CHECK ────────────────────────────────────────────────
                 stream_data = None
-                if platform == "twitch" and twitch_client_id and twitch_token:
-                    stream_data = await check_twitch_live(self._session, handle, twitch_client_id, twitch_token)
-                elif platform == "youtube" and yt_key:
-                    stream_data = await check_youtube_live(self._session, handle, yt_key)
+                if platform == "twitch":
+                    if twitch_client_id and twitch_token:
+                        stream_data = await check_twitch_live(
+                            self._session, handle, twitch_client_id, twitch_token
+                        )
+                    else:
+                        log.debug(f"[StreamNotify] Twitch API not configured, skipping '{handle}'")
+                elif platform == "youtube":
+                    if yt_key:
+                        stream_data = await check_youtube_live(self._session, handle, yt_key)
+                    else:
+                        log.debug(f"[StreamNotify] YouTube API not configured, skipping '{handle}'")
                 elif platform == "kick":
                     stream_data = await check_kick_live(self._session, handle)
+                elif platform == "tiktok":
+                    stream_data = await check_tiktok_live(self._session, handle)
 
                 was_live = user_live.get(platform, False)
                 is_live = stream_data is not None
 
                 if is_live and not was_live:
-                    # Just went live — post notification
+                    log.info(
+                        f"[StreamNotify] 🔴 {member.display_name} just went LIVE on {platform} "
+                        f"('{handle}') in guild '{guild.name}'"
+                    )
                     embed = build_live_embed(platform, stream_data, member)
                     try:
-                        await notify_channel.send(content=f"@everyone {member.mention} just went live!", embed=embed)
+                        await notify_channel.send(
+                            content=f"@everyone {member.mention} just went live!", embed=embed
+                        )
                     except discord.Forbidden:
-                        log.warning(f"No permission to post in {notify_channel}")
+                        log.warning(
+                            f"[StreamNotify] Missing permissions to post in "
+                            f"#{notify_channel.name} (guild '{guild.name}')"
+                        )
+                    except Exception as e:
+                        log.error(f"[StreamNotify] Failed to send live notification: {e}")
+                elif not is_live and was_live:
+                    log.info(
+                        f"[StreamNotify] ⚪ {member.display_name} went offline on {platform} "
+                        f"('{handle}') in guild '{guild.name}'"
+                    )
 
                 user_live[platform] = is_live
 
-                # ---- CLIPS CHECK (YouTube only for now) ----
+                # ── CLIPS CHECK (YouTube only for now) ─────────────────────────
                 if platform == "youtube" and yt_key:
                     last_time = user_last_clip.get(platform, "2020-01-01T00:00:00Z")
                     new_clips = await check_youtube_clips(self._session, handle, yt_key, last_time)
                     known_ids = user_posted.get(platform, [])
-                    new_time = last_time
                     for clip in new_clips:
                         vid_id = clip.get("video_id", "")
                         if vid_id and vid_id not in known_ids:
+                            log.info(
+                                f"[StreamNotify] 🎬 New clip from {member.display_name} on YouTube: "
+                                f"'{clip.get('title')}' ({vid_id})"
+                            )
                             embed = build_clip_embed(platform, clip, member)
                             try:
-                                await notify_channel.send(content=f"{member.mention} posted a new clip!", embed=embed)
+                                await notify_channel.send(
+                                    content=f"{member.mention} posted a new clip!", embed=embed
+                                )
                             except discord.Forbidden:
-                                pass
+                                log.warning(
+                                    f"[StreamNotify] Missing permissions to post clip in "
+                                    f"#{notify_channel.name}"
+                                )
+                            except Exception as e:
+                                log.error(f"[StreamNotify] Failed to send clip notification: {e}")
                             known_ids.append(vid_id)
-                            pub = clip.get("published_at", "")
-                            if pub > new_time:
-                                new_time = pub
-                    user_last_clip[platform] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                    user_posted[platform] = known_ids[-50:]  # keep last 50 to avoid bloat
+                    user_last_clip[platform] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    user_posted[platform] = known_ids[-50:]
 
             live_cache[user_id_str] = user_live
             last_clip_check[user_id_str] = user_last_clip
@@ -460,6 +676,30 @@ class StreamNotify(commands.Cog):
         except Exception:
             pass
 
+    @streamnotify.command(name="setinterval")
+    async def sn_setinterval(self, ctx: commands.Context, minutes: int):
+        """
+        Set how often the bot checks for live streams (in minutes).
+
+        Minimum: 1 minute. Maximum: 60 minutes. Default: 2 minutes.
+
+        Example: `[p]streamnotify setinterval 5`
+        """
+        if minutes < 1:
+            return await ctx.send("❌ Interval must be at least **1 minute**.")
+        if minutes > 60:
+            return await ctx.send("❌ Interval cannot exceed **60 minutes**.")
+        seconds = minutes * 60
+        await self.config.guild(ctx.guild).poll_interval.set(seconds)
+        log.info(
+            f"[StreamNotify] Poll interval updated to {minutes}m ({seconds}s) "
+            f"by {ctx.author} in guild '{ctx.guild.name}'"
+        )
+        await ctx.send(
+            f"✅ Stream check interval set to **{minutes} minute{'s' if minutes != 1 else ''}**.\n"
+            f"The poll loop will pick this up on its next cycle."
+        )
+
     @streamnotify.command(name="block")
     async def sn_block(self, ctx: commands.Context, member: discord.Member):
         """Add a user to the blocklist (prevents them from registering channels)."""
@@ -525,6 +765,8 @@ class StreamNotify(commands.Cog):
         yt = await cfg.youtube_api_key()
         bl = await cfg.blocklist()
         streamers = await cfg.streamers()
+        interval_secs = await cfg.poll_interval()
+        interval_mins = interval_secs // 60
 
         channel = ctx.guild.get_channel(channel_id) if channel_id else None
         role = ctx.guild.get_role(role_id) if role_id else None
@@ -532,6 +774,11 @@ class StreamNotify(commands.Cog):
         embed = discord.Embed(title="⚙️ StreamNotify Status", colour=discord.Colour.blurple())
         embed.add_field(name="Notify Channel", value=channel.mention if channel else "❌ Not set", inline=True)
         embed.add_field(name="Required Role", value=role.name if role else "❌ Not set", inline=True)
+        embed.add_field(
+            name="Poll Interval",
+            value=f"⏱️ Every **{interval_mins}** minute{'s' if interval_mins != 1 else ''}",
+            inline=True,
+        )
         embed.add_field(name="Twitch API", value="✅ Configured" if tw else "❌ Not set", inline=True)
         embed.add_field(name="YouTube API", value="✅ Configured" if yt else "❌ Not set", inline=True)
         embed.add_field(name="Registered Streamers", value=str(len(streamers)), inline=True)
