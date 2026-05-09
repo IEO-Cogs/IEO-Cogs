@@ -1,0 +1,14 @@
+{
+    "name": "StreamNotify",
+    "short": "Post live stream and clip notifications for YouTube, Twitch, Kick and TikTok.",
+    "description": "Users with a required role can DM the bot to register their streaming channels. The bot polls each registered channel every 2 minutes and posts an embed notification in a configured channel when someone goes live or uploads a new clip.",
+    "install_msg": "Thanks for installing StreamNotify!\n\nSetup steps:\n1. `[p]streamnotify setchannel #your-channel`\n2. `[p]streamnotify setrole @StreamerRole`\n3. `[p]streamnotify settwitch <client_id> <client_secret>` (optional)\n4. `[p]streamnotify setyoutube <api_key>` (optional)\n\nStreamers then DM the bot with: `add twitch <username>`",
+    "author": ["Your Name"],
+    "version": "1.0.0",
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "tags": ["streams", "notifications", "twitch", "youtube", "kick", "tiktok", "live"],
+    "requirements": ["aiohttp"]
+}
