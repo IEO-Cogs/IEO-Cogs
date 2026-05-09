@@ -795,11 +795,22 @@ class StreamNotify(commands.Cog):
         # Only handle DMs, ignore bots
         if message.guild is not None or message.author.bot:
             return
-        # Ignore bot commands
-        if message.content.startswith(tuple(await self.bot.get_prefix(message))):
-            return
 
         content = message.content.strip()
+        if not content:
+            return
+
+        # Ignore actual bot command invocations (e.g. !help, [p]command)
+        # We check against known prefixes safely — DMs may not have guild prefixes
+        try:
+            prefixes = await self.bot.get_prefix(message)
+            if isinstance(prefixes, str):
+                prefixes = [prefixes]
+            if any(content.startswith(p) for p in prefixes):
+                return
+        except Exception:
+            pass  # If prefix lookup fails in DMs, just continue
+
         lower = content.lower()
 
         # Simple help trigger
@@ -863,34 +874,69 @@ class StreamNotify(commands.Cog):
 
     async def _get_shared_guild_and_check(self, user: discord.User):
         """
-        Find a mutual guild where the user has the required streamer role and is not blocked.
-        Returns (guild, config) or (None, None) if no valid guild found.
+        Find a mutual guild where:
+          - the user is a member
+          - the user is NOT on the blocklist
+          - the user HAS the required streamer role (if one is configured)
+
+        Iterates ALL shared guilds. Returns the first valid (guild, cfg) pair,
+        or (None, None) with an explanatory DM if none qualify.
         """
+        no_role_guilds = []    # guilds where user lacks the required role
+        blocked_guilds = []    # guilds where user is blocked
+        member_of = []         # all guilds the user is a member of
+
         for guild in self.bot.guilds:
             member = guild.get_member(user.id)
             if not member:
                 continue
+
+            member_of.append(guild)
             cfg = self.config.guild(guild)
             role_id = await cfg.streamer_role()
             bl = await cfg.blocklist()
 
+            # Blocklist check
             if user.id in bl:
-                await user.send(f"🚫 You are blocked from registering channels in **{guild.name}**.")
-                return None, None
+                blocked_guilds.append(guild.name)
+                continue
 
-            if role_id:
-                if not any(r.id == role_id for r in member.roles):
-                    role = guild.get_role(role_id)
-                    role_name = role.name if role else "the required streamer role"
-                    await user.send(
-                        f"❌ You don't have the required role **{role_name}** in **{guild.name}** "
-                        f"to register channels."
-                    )
-                    return None, None
+            # Role check — only enforced when a role has actually been configured
+            if role_id and not any(r.id == role_id for r in member.roles):
+                role = guild.get_role(role_id)
+                no_role_guilds.append((guild.name, role.name if role else "Unknown Role"))
+                continue
 
+            # All checks passed — this guild is valid
+            log.debug(
+                f"[StreamNotify] DM registration: '{user}' passed checks for guild '{guild.name}'"
+            )
             return guild, cfg
 
-        await user.send("❌ We don't share any server where I can register channels for you.")
+        # Nothing passed — send a useful error
+        if not member_of:
+            await user.send(
+                "❌ I couldn't find any server we share. "
+                "Make sure you're in the same server as me and try again."
+            )
+        elif blocked_guilds:
+            names = ", ".join(f"**{n}**" for n in blocked_guilds)
+            await user.send(f"🚫 You are blocked from registering channels in: {names}.")
+        elif no_role_guilds:
+            lines = "\n".join(
+                f"• **{gname}** — requires the **{rname}** role"
+                for gname, rname in no_role_guilds
+            )
+            await user.send(
+                f"❌ You don't have the required streamer role in the following server(s):\n{lines}\n\n"
+                f"Ask a server admin to assign you the role, then try again."
+            )
+        else:
+            await user.send(
+                "❌ Something went wrong finding a valid server. "
+                "Make sure the bot is configured in your server (`[p]streamnotify status`)."
+            )
+
         return None, None
 
     async def _register_channel(self, user: discord.User, platform: str, handle: str):
