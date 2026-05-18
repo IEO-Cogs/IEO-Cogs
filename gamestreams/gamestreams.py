@@ -49,8 +49,8 @@ log = logging.getLogger("akaicogs.gamestreams")
 class GameStreams(commands.Cog):
     """Receive live announcements for new game streams."""
 
-    __version__ = "0.5.2"
-    __author__ = "Akai"
+    __version__ = "0.6.0"
+    __author__ = "Akai & AI"
 
     def __init__(self, bot: Red) -> None:
         self.bot = bot
@@ -104,16 +104,38 @@ class GameStreams(commands.Cog):
         game_name = game_alert["game"]
         game = await self.fetch_game(game_name, headers=headers)
         alerts = game_alert["alerts"]
-        streams = await game.fetch_streams()
+        
+        # Fetch raw streams from Twitch API
+        all_streams = await game.fetch_streams()
+        
+        # Apply filters globally across the tracked game streams
+        # Note: Since filters are bound to individual channels in config, 
+        # we check if *any* alert allows the stream to minimize processing redundancy,
+        # or we pass everything and filter specifically when preparing to send.
+        # To maintain accuracy for specific channels, we filter per alert rule:
+        
+        filtered_streams = []
+        for stream in all_streams:
+            # Check if this stream passes filters for AT LEAST one active channel alert configuration
+            for alert in alerts:
+                lang_filter = alert.get("language")
+                title_filter = alert.get("title_match")
+                
+                lang_match = (lang_filter is None) or (stream.language.lower() == lang_filter.lower())
+                title_match = (title_filter is None) or (title_filter.lower() in stream.title.lower())
+                
+                if lang_match and title_match:
+                    filtered_streams.append(stream)
+                    break
 
         if game in self.monitored_games.keys():
             new_streams = [
-                stream for stream in streams if not stream in self.monitored_games[game]
+                stream for stream in filtered_streams if not stream in self.monitored_games[game]
             ]
-            self.monitored_games[game] = streams
+            self.monitored_games[game] = filtered_streams
             return new_streams, alerts
         else:
-            self.monitored_games[game] = streams
+            self.monitored_games[game] = filtered_streams
             return [], alerts
 
     @tasks.loop(minutes=5)
@@ -135,15 +157,20 @@ class GameStreams(commands.Cog):
 
             if new_game_alerts:
                 new_streams, alerts = new_game_alerts
-                log.debug(
-                    f"New streams for game {game_alert['game'].title()}: {', '.join(stream.title for stream in new_streams)}"
-                )
 
                 for stream in new_streams:
                     embed = stream.make_embed()
 
                     for alert in alerts:
-                        to_post_alerts.setdefault(alert["channel_id"], []).append(embed)
+                        # Channel-specific execution filter check
+                        lang_filter = alert.get("language")
+                        title_filter = alert.get("title_match")
+                        
+                        lang_match = (lang_filter is None) or (stream.language.lower() == lang_filter.lower())
+                        title_match = (title_filter is None) or (title_filter.lower() in stream.title.lower())
+                        
+                        if lang_match and title_match:
+                            to_post_alerts.setdefault(alert["channel_id"], []).append(embed)
 
         if to_post_alerts:
             for channel_id, embeds in to_post_alerts.items():
@@ -151,9 +178,7 @@ class GameStreams(commands.Cog):
                 if channel is not None:
                     for embeds_chunk in discord.utils.as_chunks(embeds, max_size=10):
                         try:
-                            await channel.send(content="Some new streams have started: ", embeds=embeds_chunk)  # type: ignore # Will always be discord.TextChannel
-                        # except discord.HTTPException:
-                        #     pass
+                            await channel.send(content="Some new streams have started: ", embeds=embeds_chunk)  # type: ignore 
                         except Exception as error:
                             log.error(error)
 
@@ -311,6 +336,8 @@ class GameStreams(commands.Cog):
                         {
                             "guild_id": ctx.guild.id,
                             "channel_id": channel.id,
+                            "language": None,
+                            "title_match": None,
                         }
                     )
                 break
@@ -322,6 +349,8 @@ class GameStreams(commands.Cog):
                         {
                             "guild_id": ctx.guild.id,
                             "channel_id": channel.id,
+                            "language": None,
+                            "title_match": None,
                         }
                     ],
                 }
@@ -335,9 +364,61 @@ class GameStreams(commands.Cog):
         )
         await ctx.reply(message, mention_author=False)
 
+    @gamestreams_twitch.command(name="filter", cooldown_after_parsing=True)
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    async def gamestreams_twitch_filter(
+        self,
+        ctx: commands.GuildContext,
+        channel: discord.TextChannel,
+        game_name: str,
+        filter_type: str,
+        *,
+        value: Optional[str] = None
+    ) -> None:
+        """Configure filters for a stream alert rule.
+        
+        `[filter_type]` can be either `language` or `title`.
+        Leave `[value]` empty to completely remove the filter.
+        
+        Example:
+        `[p]gamestream twitch filter #streams "Call of Duty" language English`
+        `[p]gamestream twitch filter #streams "Call of Duty" title DMZ`
+        `[p]gamestream twitch filter #streams "Call of Duty" title` (Clears title filter)
+        """
+        if filter_type.lower() not in ["language", "title"]:
+            await ctx.send("Filter type must be either `language` or `title`.")
+            return
+
+        alerts = await self.config.alerts()
+        found = False
+
+        for alert in alerts:
+            if alert["game"] == game_name.lower():
+                for game_alert in alert["alerts"]:
+                    if (
+                        game_alert["guild_id"] == ctx.guild.id
+                        and game_alert["channel_id"] == channel.id
+                    ):
+                        key = "language" if filter_type.lower() == "language" else "title_match"
+                        game_alert[key] = value if value else None
+                        found = True
+                        break
+
+        if not found:
+            await ctx.send(f"Could not find an active alert setup for `{game_name}` in {channel.mention}.")
+            return
+
+        await self.config.alerts.set(alerts)
+        
+        if value:
+            await ctx.send(f"Successfully set `{filter_type}` filter to `{value}` for `{game_name}` in {channel.mention}.")
+        else:
+            await ctx.send(f"Successfully cleared `{filter_type}` filter for `{game_name}` in {channel.mention}.")
+
     @gamestreams_twitch.command(name="alerts", cooldown_after_parsing=True)
     @commands.guild_only()
-    @commands.is_owner()
+    @commands.has_permissions(manage_guild=True)
     @commands.cooldown(rate=1, per=5, type=commands.BucketType.member)
     async def gamestreams_twitch_alerts(
         self,
@@ -354,26 +435,33 @@ class GameStreams(commands.Cog):
             game_alerts = alert["alerts"]
 
             description = ""
+            idx = 1
 
-            for j, game_alert in enumerate(game_alerts):
+            for game_alert in game_alerts:
                 guild = ctx.bot.get_guild(game_alert["guild_id"])
-                channel = guild.get_channel(game_alert["channel_id"]) if guild else None
-
-                description += f"{j+1}. {channel.mention if channel else 'Channel Not Found'} - {guild.name if guild else 'Guild Not Found'}\n"
-
-            embed = discord.Embed(
-                title=game_name.title(),
-                description=description,
-                colour=discord.Colour.random(),
-            )
-
-            embed.set_footer(text=f"Page {i + 1}/{len(alerts)}")
+                # Show all server entries if owner, else restrict presentation to current guild context
+                if guild and guild.id == ctx.guild.id:
+                    channel = guild.get_channel(game_alert["channel_id"])
+                    lang = game_alert.get("language") or "None"
+                    title = game_alert.get("title_match") or "None"
+                    
+                    description += (
+                        f"**{idx}.** {channel.mention if channel else 'Channel Not Found'}\n"
+                        f" └ Lang Filter: `{lang}` | Title Filter: `{title}`\n"
+                    )
+                    idx += 1
 
             if description:
+                embed = discord.Embed(
+                    title=game_name.title(),
+                    description=description,
+                    colour=discord.Colour.random(),
+                )
+                embed.set_footer(text=f"Page {i + 1}/{len(alerts)}")
                 embeds.append(embed)
 
         if embeds:
             pages = SimpleMenu(embeds, disable_after_timeout=True)  # type: ignore
             await pages.start(ctx)
         else:
-            await ctx.send("No saved game alerts.")
+            await ctx.send("No active alerts configured for this server.")
