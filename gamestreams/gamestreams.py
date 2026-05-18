@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import re
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
@@ -49,7 +50,7 @@ log = logging.getLogger("akaicogs.gamestreams")
 class GameStreams(commands.Cog):
     """Receive live announcements for new game streams."""
 
-    __version__ = "0.6.0"
+    __version__ = "0.6.3"
     __author__ = "Akai & AI"
 
     def __init__(self, bot: Red) -> None:
@@ -102,21 +103,16 @@ class GameStreams(commands.Cog):
         self, game_alert: dict, headers: dict
     ) -> Optional[Tuple[List[Stream], List[dict]]]:
         game_name = game_alert["game"]
-        game = await self.fetch_game(game_name, headers=headers)
+        try:
+            game = await self.fetch_game(game_name, headers=headers)
+        except GameNotFoundError:
+            return None
+            
         alerts = game_alert["alerts"]
-        
-        # Fetch raw streams from Twitch API
         all_streams = await game.fetch_streams()
-        
-        # Apply filters globally across the tracked game streams
-        # Note: Since filters are bound to individual channels in config, 
-        # we check if *any* alert allows the stream to minimize processing redundancy,
-        # or we pass everything and filter specifically when preparing to send.
-        # To maintain accuracy for specific channels, we filter per alert rule:
         
         filtered_streams = []
         for stream in all_streams:
-            # Check if this stream passes filters for AT LEAST one active channel alert configuration
             for alert in alerts:
                 lang_filter = alert.get("language")
                 title_filter = alert.get("title_match")
@@ -162,7 +158,6 @@ class GameStreams(commands.Cog):
                     embed = stream.make_embed()
 
                     for alert in alerts:
-                        # Channel-specific execution filter check
                         lang_filter = alert.get("language")
                         title_filter = alert.get("title_match")
                         
@@ -249,6 +244,8 @@ class GameStreams(commands.Cog):
             )
             return
 
+        game_name = game_name.strip("'\"")
+
         try:
             game = await self.fetch_game(game_name, headers=headers)
         except Exception as error:
@@ -289,9 +286,13 @@ class GameStreams(commands.Cog):
         ctx: commands.GuildContext,
         channel: Optional[discord.TextChannel] = None,
         *,
-        game_name: str,
+        game_and_filters: str,
     ) -> None:
-        """Announce streams for a specific game."""
+        """Announce streams for a specific game with optional filters.
+        
+        Syntax:
+        `[p]gamestream twitch alert [channel] <game_name> [lang/language=<val>] [title=<val>]`
+        """
         if self.streams_cog is None:
             await ctx.send(
                 f"Streams cog is currently not loaded. {' You can load the cog using `[p]load streams`' if await self.bot.is_owner(ctx.author) else ''}"
@@ -311,6 +312,29 @@ class GameStreams(commands.Cog):
                 return
             channel = ctx.channel
 
+        # Capture both filters out of string
+        lang_match = re.search(r"(?:lang|language)=(?:\"([^\"]+)\"|'([^']+)'|(\S+))", game_and_filters, re.IGNORECASE)
+        title_match = re.search(r"title=(?:\"([^\"]+)\"|'([^']+)'|(.+))$", game_and_filters, re.IGNORECASE)
+
+        language_val = None
+        if lang_match:
+            language_val = lang_match.group(1) or lang_match.group(2) or lang_match.group(3)
+
+        title_val = None
+        if title_match:
+            title_val = title_match.group(1) or title_match.group(2) or title_match.group(3)
+            if title_val:
+                title_val = title_val.strip()
+
+        # Isolate game title text
+        game_name = game_and_filters
+        if lang_match:
+            game_name = game_name.replace(lang_match.group(0), "")
+        if title_match:
+            game_name = game_name.replace(title_match.group(0), "")
+            
+        game_name = game_name.strip().strip("'\"").strip()
+
         try:
             game = await self.fetch_game(game_name, headers=headers)
         except Exception as error:
@@ -318,7 +342,6 @@ class GameStreams(commands.Cog):
             return
 
         alerts = await self.config.alerts()
-
         removed = False
 
         for alert in alerts:
@@ -328,16 +351,28 @@ class GameStreams(commands.Cog):
                         game_alert["guild_id"] == ctx.guild.id
                         and game_alert["channel_id"] == channel.id
                     ):
-                        alert["alerts"].remove(game_alert)
-                        removed = True
-                        break
+                        # FIX: Retain previously configured values if they are missing from current call
+                        final_lang = language_val if lang_match else game_alert.get("language")
+                        final_title = title_val if title_match else game_alert.get("title_match")
+                        
+                        if final_lang or final_title:
+                            game_alert["language"] = final_lang
+                            game_alert["title_match"] = final_title
+                            message = f"Updated filters for `{game.name}` in {channel.mention}: Language=`{final_lang}`, Title Contains=`{final_title}`."
+                            await self.config.alerts.set(alerts)
+                            await ctx.reply(message, mention_author=False)
+                            return
+                        else:
+                            alert["alerts"].remove(game_alert)
+                            removed = True
+                            break
                 else:
                     alert["alerts"].append(
                         {
                             "guild_id": ctx.guild.id,
                             "channel_id": channel.id,
-                            "language": None,
-                            "title_match": None,
+                            "language": language_val,
+                            "title_match": title_val,
                         }
                     )
                 break
@@ -349,8 +384,8 @@ class GameStreams(commands.Cog):
                         {
                             "guild_id": ctx.guild.id,
                             "channel_id": channel.id,
-                            "language": None,
-                            "title_match": None,
+                            "language": language_val,
+                            "title_match": title_val,
                         }
                     ],
                 }
@@ -358,63 +393,14 @@ class GameStreams(commands.Cog):
 
         await self.config.alerts.set(alerts)
 
-        message = (
-            f"Successfully {'removed' if removed else 'added'} alert for `{game.name}` "
-            f"to {channel.mention}."
-        )
-        await ctx.reply(message, mention_author=False)
-
-    @gamestreams_twitch.command(name="filter", cooldown_after_parsing=True)
-    @commands.guild_only()
-    @commands.has_permissions(manage_guild=True)
-    async def gamestreams_twitch_filter(
-        self,
-        ctx: commands.GuildContext,
-        channel: discord.TextChannel,
-        game_name: str,
-        filter_type: str,
-        *,
-        value: Optional[str] = None
-    ) -> None:
-        """Configure filters for a stream alert rule.
-        
-        `[filter_type]` can be either `language` or `title`.
-        Leave `[value]` empty to completely remove the filter.
-        
-        Example:
-        `[p]gamestream twitch filter #streams "Call of Duty" language English`
-        `[p]gamestream twitch filter #streams "Call of Duty" title DMZ`
-        `[p]gamestream twitch filter #streams "Call of Duty" title` (Clears title filter)
-        """
-        if filter_type.lower() not in ["language", "title"]:
-            await ctx.send("Filter type must be either `language` or `title`.")
-            return
-
-        alerts = await self.config.alerts()
-        found = False
-
-        for alert in alerts:
-            if alert["game"] == game_name.lower():
-                for game_alert in alert["alerts"]:
-                    if (
-                        game_alert["guild_id"] == ctx.guild.id
-                        and game_alert["channel_id"] == channel.id
-                    ):
-                        key = "language" if filter_type.lower() == "language" else "title_match"
-                        game_alert[key] = value if value else None
-                        found = True
-                        break
-
-        if not found:
-            await ctx.send(f"Could not find an active alert setup for `{game_name}` in {channel.mention}.")
-            return
-
-        await self.config.alerts.set(alerts)
-        
-        if value:
-            await ctx.send(f"Successfully set `{filter_type}` filter to `{value}` for `{game_name}` in {channel.mention}.")
+        if removed:
+            message = f"Successfully removed alert for `{game.name}` from {channel.mention}."
         else:
-            await ctx.send(f"Successfully cleared `{filter_type}` filter for `{game_name}` in {channel.mention}.")
+            message = f"Successfully added alert for `{game.name}` to {channel.mention}."
+            if language_val or title_val:
+                message += f" (Filters -> Language: `{language_val}` | Title contains: `{title_val}`)"
+        
+        await ctx.reply(message, mention_author=False)
 
     @gamestreams_twitch.command(name="alerts", cooldown_after_parsing=True)
     @commands.guild_only()
@@ -427,23 +413,20 @@ class GameStreams(commands.Cog):
         """Check all the streams that get announced."""
 
         alerts = await self.config.alerts()
-
         embeds: List[discord.Embed] = []
 
         for i, alert in enumerate(alerts):
             game_name = alert["game"]
             game_alerts = alert["alerts"]
-
             description = ""
             idx = 1
 
             for game_alert in game_alerts:
                 guild = ctx.bot.get_guild(game_alert["guild_id"])
-                # Show all server entries if owner, else restrict presentation to current guild context
                 if guild and guild.id == ctx.guild.id:
                     channel = guild.get_channel(game_alert["channel_id"])
-                    lang = game_alert.get("language") or "None"
-                    title = game_alert.get("title_match") or "None"
+                    lang = game_alert.get("language") or "None (Disabled)"
+                    title = game_alert.get("title_match") or "None (Disabled)"
                     
                     description += (
                         f"**{idx}.** {channel.mention if channel else 'Channel Not Found'}\n"
